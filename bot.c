@@ -1,17 +1,25 @@
 /*
- * bot.c - Telegram bot to control terminal windows on macOS
+ * bot.c - Telegram bot to control tmux panes and Terminal.app tabs
  *
- * Allows capturing screenshots and sending keystrokes to terminal applications
- * (Terminal, iTerm2, Ghostty, kitty, etc.) via Telegram messages.
+ * Allows reading the screen content and sending keystrokes to tmux panes
+ * (via the tmux command) and macOS Terminal.app tabs (via AppleScript)
+ * from Telegram messages.
  *
  * Commands:
- *   .list    - List available terminal windows
- *   .1 .2 .. - Connect to window by number
+ *   .list    - List tmux panes and Terminal.app tabs
+ *   .1 .2 .. - Connect to a terminal by number
+ *   .stream  - Keep the last screen message updated as the terminal changes
+ *   .stop    - Stop streaming
+ *   .esc .ctrl_c .enter ... - Send a key
  *   .help    - Show help
+ *
+ * The Telegram menu offers the same commands as /_list, /_stream and so
+ * forth. Plain "/" messages are typed in the terminal instead, since many
+ * programs (like coding agents) have their own slash commands.
  *
  * Once connected, any text is sent as keystrokes (newline auto-added).
  * End with 💜 to suppress the automatic newline.
- * Emoji modifiers: ❤️ (Ctrl), 💙 (Alt), 💚 (Cmd), 💛 (ESC)
+ * Emoji modifiers: ❤️ (Ctrl), 💙 (Alt), 💛 (ESC), 🧡 (Enter)
  */
 
 #include <stdio.h>
@@ -20,61 +28,63 @@
 #include <strings.h>
 #include <unistd.h>
 #include <ctype.h>
+#include <fcntl.h>
+#include <spawn.h>
 #include <pthread.h>
-
-#include <CoreGraphics/CoreGraphics.h>
-#include <CoreFoundation/CoreFoundation.h>
-#include <ImageIO/ImageIO.h>
-#include <ApplicationServices/ApplicationServices.h>
+#include <sys/wait.h>
+#include <time.h>
 
 #include "botlib.h"
 #include "sha1.h"
 #include "qrcodegen.h"
 
-/* ============================================================================
- * Terminal Window Management
- * ========================================================================= */
+extern char **environ;
 
-#define kVK_Return    0x24
-#define kVK_Tab       0x30
-#define kVK_Escape    0x35
+/* ============================================================================
+ * State
+ * ========================================================================= */
 
 #define MOD_CTRL    (1<<0)
 #define MOD_ALT     (1<<1)
-#define MOD_CMD     (1<<2)
 
-/* Known terminal application names. */
-static const char *TerminalApps[] = {
-    "Terminal", "iTerm2", "iTerm", "Ghostty", "kitty", "Alacritty",
-    "Hyper", "Warp", "WezTerm", "Tabby", NULL
-};
+/* Kinds of terminals we can control. */
+#define TARGET_TMUX 0                 /* A tmux pane. */
+#define TARGET_TERMINAL 1             /* A macOS Terminal.app tab. */
 
-/* Window information. */
+/* Terminal information. */
 typedef struct {
-    CGWindowID window_id;
-    pid_t pid;
-    char owner[128];
-    char title[256];
-} WinInfo;
+    int kind;           /* TARGET_TMUX or TARGET_TERMINAL. */
+    char id[64];        /* tmux pane ID like "%5", or the tty of the
+                         * Terminal.app tab like "/dev/ttys003". Both are
+                         * stable for the life of the terminal. */
+    char label[256];    /* Human readable description for .list. */
+} Target;
 
 /* Global state. */
 static pthread_mutex_t RequestLock = PTHREAD_MUTEX_INITIALIZER;
-static int DangerMode = 0;            /* If 1, show all windows, not just terminals. */
-static WinInfo *WindowList = NULL;    /* Cached window list for .list display. */
-static int WindowCount = 0;           /* Number of windows in list. */
+static Target *TargetList = NULL;     /* Cached list for .list display. */
+static int TargetCount = 0;           /* Number of terminals in list. */
 
 /* TOTP authentication state. */
 static int WeakSecurity = 0;          /* If 1, skip all OTP logic. */
-static int Authenticated = 0;        /* Whether OTP has been verified. */
-static time_t LastActivity = 0;      /* Last time owner sent a valid command. */
-static int OtpTimeout = 300;         /* Timeout in seconds (default 5 min). */
+static int Authenticated = 0;         /* Whether OTP has been verified. */
+static time_t LastActivity = 0;       /* Last time owner sent a valid command. */
+static int OtpTimeout = 300;          /* Timeout in seconds (default 5 min). */
 
-/* Connected window - stored directly, not as index. */
+/* Connected terminal. */
 static int Connected = 0;             /* 1 if connected, 0 otherwise. */
-static CGWindowID ConnectedWid = 0;   /* Window ID of connected window. */
-static pid_t ConnectedPid = 0;        /* PID of connected window. */
-static char ConnectedOwner[128];      /* Owner name for display. */
-static char ConnectedTitle[256];      /* Title for display. */
+static int ConnectedKind = 0;         /* TARGET_* of the connected terminal. */
+static char ConnectedId[64];          /* ID of the connected terminal. */
+static char ConnectedLabel[256];      /* Label for display. */
+
+/* Last screen message sent. While streaming, it is edited as the terminal
+ * content changes. */
+#define STREAM_INTERVAL 2             /* Min seconds between stream edits. */
+static int Streaming = 0;             /* 1 if streaming is active. */
+static int64_t ScreenChat = 0;        /* Chat of the last screen message. */
+static int64_t ScreenMsgId = 0;       /* ID of the last screen message. */
+static sds ScreenLast = NULL;         /* Screen text it currently shows. */
+static time_t ScreenTime = 0;         /* Time it was sent or last edited. */
 
 /* ============================================================================
  * TOTP Authentication
@@ -270,11 +280,10 @@ int match_red_heart(const unsigned char *p, size_t remaining) {
     return 0;
 }
 
-/* Match colored hearts 💙💚💛 (F0 9F 92 99/9A/9B). */
+/* Match colored hearts 💙💛 (F0 9F 92 99/9B). */
 int match_colored_heart(const unsigned char *p, size_t remaining, char *heart) {
     if (remaining >= 4 && p[0] == 0xF0 && p[1] == 0x9F && p[2] == 0x92) {
         if (p[3] == 0x99) { *heart = 'B'; return 4; }  /* 💙 Blue = Alt */
-        if (p[3] == 0x9A) { *heart = 'G'; return 4; }  /* 💚 Green = Cmd */
         if (p[3] == 0x9B) { *heart = 'Y'; return 4; }  /* 💛 Yellow = ESC */
     }
     return 0;
@@ -305,343 +314,247 @@ int ends_with_purple_heart(const char *text) {
 }
 
 /* ============================================================================
- * Window Functions
+ * Terminal Functions
  * ========================================================================= */
 
-/* Check if app name is a known terminal. */
-int is_terminal_app(const char *name) {
-    for (int i = 0; TerminalApps[i]; i++) {
-        if (strcasestr(name, TerminalApps[i])) return 1;
+/* AppleScript programs used to control Terminal.app. The tabs are always
+ * addressed by index and never via loop variables, since "contents of"
+ * a variable dereferences the variable instead of reading the tab
+ * contents. Note that "tab" is a Terminal.app class, so the field
+ * separator is built with "character id 9". */
+
+/* List every tab as: tty, window index, tab index, command, title.
+ * The processes of a tab are in creation order: login, the shell, then
+ * the job the shell is running and its children, so the third one is
+ * the command shown, like the pane command reported by tmux. */
+#define TERMINAL_LIST_SCRIPT \
+    "if application \"Terminal\" is not running then return \"\"\n" \
+    "set sep to character id 9\n" \
+    "set out to \"\"\n" \
+    "tell application \"Terminal\"\n" \
+    "  set wi to 0\n" \
+    "  repeat with w in windows\n" \
+    "    set wi to wi + 1\n" \
+    "    repeat with ti from 1 to count of tabs of w\n" \
+    "      set procs to processes of tab ti of w\n" \
+    "      set cmd to \"\"\n" \
+    "      if (count of procs) >= 3 then\n" \
+    "        set cmd to item 3 of procs\n" \
+    "      else if (count of procs) > 0 then\n" \
+    "        set cmd to last item of procs\n" \
+    "      end if\n" \
+    "      set out to out & (tty of tab ti of w) & sep & wi & sep & ti & " \
+                          "sep & cmd & sep & (custom title of tab ti of w) & linefeed\n" \
+    "    end repeat\n" \
+    "  end repeat\n" \
+    "end tell\n" \
+    "return out\n"
+
+/* Return the visible contents of the tab with the tty in argv[1]. */
+#define TERMINAL_CONTENTS_SCRIPT \
+    "on run argv\n" \
+    "  tell application \"Terminal\"\n" \
+    "    repeat with w in windows\n" \
+    "      repeat with i from 1 to count of tabs of w\n" \
+    "        if tty of tab i of w is item 1 of argv then return contents of tab i of w\n" \
+    "      end repeat\n" \
+    "    end repeat\n" \
+    "  end tell\n" \
+    "  error number 1\n" \
+    "end run\n"
+
+/* Type argv[2] in the tab with the tty in argv[1]. Terminal.app appends
+ * a newline to the text. */
+#define TERMINAL_TYPE_SCRIPT \
+    "on run argv\n" \
+    "  tell application \"Terminal\"\n" \
+    "    repeat with w in windows\n" \
+    "      repeat with i from 1 to count of tabs of w\n" \
+    "        if tty of tab i of w is item 1 of argv then\n" \
+    "          do script (item 2 of argv) in tab i of w\n" \
+    "          return\n" \
+    "        end if\n" \
+    "      end repeat\n" \
+    "    end repeat\n" \
+    "  end tell\n" \
+    "  error number 1\n" \
+    "end run\n"
+
+/* Run the program argv[0] with the given NULL terminated argument vector.
+ * If 'output' is not NULL, the standard output of the program is returned
+ * there as a new sds string. Returns the program exit code, or -1 if the
+ * program could not be executed. */
+static int run_command(char *const argv[], sds *output) {
+    int fds[2];
+    if (pipe(fds) == -1) return -1;
+
+    posix_spawn_file_actions_t actions;
+    posix_spawn_file_actions_init(&actions);
+    posix_spawn_file_actions_adddup2(&actions, fds[1], STDOUT_FILENO);
+    posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null",
+                                     O_WRONLY, 0);
+    posix_spawn_file_actions_addclose(&actions, fds[0]);
+    posix_spawn_file_actions_addclose(&actions, fds[1]);
+
+    pid_t pid;
+    int err = posix_spawnp(&pid, argv[0], &actions, NULL, argv, environ);
+    posix_spawn_file_actions_destroy(&actions);
+    close(fds[1]);
+    if (err != 0) {
+        close(fds[0]);
+        return -1;
     }
-    return 0;
+
+    sds out = sdsempty();
+    char buf[4096];
+    ssize_t n;
+    while ((n = read(fds[0], buf, sizeof(buf))) > 0)
+        out = sdscatlen(out, buf, n);
+    close(fds[0]);
+
+    int status;
+    if (waitpid(pid, &status, 0) == -1 || !WIFEXITED(status)) {
+        sdsfree(out);
+        return -1;
+    }
+    if (output) *output = out; else sdsfree(out);
+    return WEXITSTATUS(status);
 }
 
-/* Free the cached window list. */
-void free_window_list(void) {
-    if (WindowList) {
-        free(WindowList);
-        WindowList = NULL;
-    }
-    WindowCount = 0;
+/* Free the cached terminal list. */
+static void free_target_list(void) {
+    xfree(TargetList);
+    TargetList = NULL;
+    TargetCount = 0;
 }
 
-/* Refresh the window list. Returns number of windows found. */
-int refresh_window_list(void) {
-    free_window_list();
-
-    CFArrayRef list = CGWindowListCopyWindowInfo(
-        kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
-        kCGNullWindowID
-    );
-    if (!list) return 0;
-
-    CFIndex count = CFArrayGetCount(list);
-
-    /* Allocate maximum possible size. */
-    WindowList = malloc(count * sizeof(WinInfo));
-    if (!WindowList) {
-        CFRelease(list);
-        return 0;
-    }
-
-    for (CFIndex i = 0; i < count; i++) {
-        CFDictionaryRef info = CFArrayGetValueAtIndex(list, i);
-
-        /* Get owner name. */
-        CFStringRef owner_ref = CFDictionaryGetValue(info, kCGWindowOwnerName);
-        if (!owner_ref) continue;
-
-        char owner[128];
-        if (!CFStringGetCString(owner_ref, owner, sizeof(owner), kCFStringEncodingUTF8))
-            continue;
-
-        /* Filter to terminals only unless in danger mode. */
-        if (!DangerMode && !is_terminal_app(owner)) continue;
-
-        /* Get window ID and PID. */
-        CFNumberRef wid_ref = CFDictionaryGetValue(info, kCGWindowNumber);
-        CFNumberRef pid_ref = CFDictionaryGetValue(info, kCGWindowOwnerPID);
-        if (!wid_ref || !pid_ref) continue;
-
-        CGWindowID wid;
-        pid_t pid;
-        CFNumberGetValue(wid_ref, kCGWindowIDCFNumberType, &wid);
-        CFNumberGetValue(pid_ref, kCFNumberIntType, &pid);
-
-        /* Only layer 0. */
-        CFNumberRef layer_ref = CFDictionaryGetValue(info, kCGWindowLayer);
-        int layer = 0;
-        if (layer_ref) CFNumberGetValue(layer_ref, kCFNumberIntType, &layer);
-        if (layer != 0) continue;
-
-        /* Must have reasonable size. */
-        CFDictionaryRef bounds_dict = CFDictionaryGetValue(info, kCGWindowBounds);
-        if (!bounds_dict) continue;
-
-        CGRect bounds;
-        CGRectMakeWithDictionaryRepresentation(bounds_dict, &bounds);
-        if (bounds.size.width <= 50 || bounds.size.height <= 50) continue;
-
-        /* Get window title. */
-        CFStringRef title_ref = CFDictionaryGetValue(info, kCGWindowName);
-        char title[256] = "";
-        if (title_ref)
-            CFStringGetCString(title_ref, title, sizeof(title), kCFStringEncodingUTF8);
-
-        /* Add to list. */
-        WinInfo *w = &WindowList[WindowCount++];
-        w->window_id = wid;
-        w->pid = pid;
-        strncpy(w->owner, owner, sizeof(w->owner) - 1);
-        w->owner[sizeof(w->owner) - 1] = '\0';
-        strncpy(w->title, title, sizeof(w->title) - 1);
-        w->title[sizeof(w->title) - 1] = '\0';
-    }
-
-    CFRelease(list);
-    return WindowCount;
+/* Append a terminal to the cached list. */
+static void add_target(int kind, const char *id, const char *label) {
+    TargetList = xrealloc(TargetList, (TargetCount + 1) * sizeof(Target));
+    Target *t = &TargetList[TargetCount++];
+    t->kind = kind;
+    snprintf(t->id, sizeof(t->id), "%s", id);
+    snprintf(t->label, sizeof(t->label), "%s", label);
 }
 
-/* Check if connected window still exists on screen. If the exact window ID
- * is gone but the same PID still has an on-screen window (tab switch),
- * update ConnectedWid to the new window. */
-int connected_window_exists(void) {
-    if (!Connected) return 0;
+/* Run 'argv' and call add_target() for every line of its output, which
+ * must have 'numfields' tab separated fields, formatted by 'format'. */
+static void list_targets(char *const argv[], int numfields, int kind,
+                         void (*format)(sds *fields, char *label, size_t size))
+{
+    sds out;
+    if (run_command(argv, &out) != 0) return;
 
-    CFArrayRef list = CGWindowListCopyWindowInfo(
-        kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
-        kCGNullWindowID
-    );
-    if (!list) return 0;
-
-    int found = 0;
-    CGWindowID fallback_wid = 0;
-    CFIndex count = CFArrayGetCount(list);
-    for (CFIndex i = 0; i < count; i++) {
-        CFDictionaryRef info = CFArrayGetValueAtIndex(list, i);
-        CFNumberRef wid_ref = CFDictionaryGetValue(info, kCGWindowNumber);
-        CFNumberRef pid_ref = CFDictionaryGetValue(info, kCGWindowOwnerPID);
-        if (!wid_ref || !pid_ref) continue;
-
-        CGWindowID wid;
-        pid_t pid;
-        CFNumberGetValue(wid_ref, kCGWindowIDCFNumberType, &wid);
-        CFNumberGetValue(pid_ref, kCFNumberIntType, &pid);
-
-        if (wid == ConnectedWid) {
-            found = 1;
-            break;
+    int count;
+    sds *lines = sdssplitlen(out, sdslen(out), "\n", 1, &count);
+    sdsfree(out);
+    for (int i = 0; i < count; i++) {
+        int nf;
+        sds *f = sdssplitlen(lines[i], sdslen(lines[i]), "\t", 1, &nf);
+        if (nf == numfields) {
+            char label[256];
+            format(f, label, sizeof(label));
+            add_target(kind, f[0], label);
         }
-
-        /* Track a fallback: another on-screen window from the same PID. */
-        if (pid == ConnectedPid && !fallback_wid) {
-            CFNumberRef layer_ref = CFDictionaryGetValue(info, kCGWindowLayer);
-            int layer = 0;
-            if (layer_ref) CFNumberGetValue(layer_ref, kCFNumberIntType, &layer);
-            if (layer == 0) fallback_wid = wid;
-        }
+        sdsfreesplitres(f, nf);
     }
+    sdsfreesplitres(lines, count);
+}
 
-    /* Window gone but same app has another window — likely a tab switch. */
-    if (!found && fallback_wid) {
-        ConnectedWid = fallback_wid;
-        found = 1;
+/* Label for a tmux pane: "session:window.pane name (command)", showing the
+ * window name only if it adds information. */
+static void tmux_label(sds *f, char *label, size_t size) {
+    if (strcmp(f[2], f[3]) == 0)
+        snprintf(label, size, "%s (%s)", f[1], f[3]);
+    else
+        snprintf(label, size, "%s %s (%s)", f[1], f[2], f[3]);
+}
+
+/* Label for a Terminal.app tab: "Terminal window.tab title (command)". */
+static void terminal_label(sds *f, char *label, size_t size) {
+    if (sdslen(f[4]) == 0)
+        snprintf(label, size, "Terminal %s.%s (%s)", f[1], f[2], f[3]);
+    else
+        snprintf(label, size, "Terminal %s.%s %s (%s)", f[1], f[2], f[4], f[3]);
+}
+
+/* Refresh the list with the panes of all the tmux sessions, followed by
+ * the tabs of all the Terminal.app windows. Returns the number of
+ * terminals found. */
+static int refresh_target_list(void) {
+    free_target_list();
+
+    char *tmux_argv[] = {"tmux", "list-panes", "-a", "-F",
+        "#{pane_id}\t#{session_name}:#{window_index}.#{pane_index}\t"
+        "#{window_name}\t#{pane_current_command}", NULL};
+    list_targets(tmux_argv, 4, TARGET_TMUX, tmux_label);
+
+    char *terminal_argv[] = {"osascript", "-e", TERMINAL_LIST_SCRIPT, NULL};
+    list_targets(terminal_argv, 5, TARGET_TERMINAL, terminal_label);
+    return TargetCount;
+}
+
+/* Return a copy of the screen without trailing spaces in every line and
+ * without trailing empty lines. */
+static sds trim_screen(const char *screen) {
+    int count;
+    sds *lines = sdssplitlen(screen, strlen(screen), "\n", 1, &count);
+    int last = count;   /* Number of lines to keep. */
+    for (int i = 0; i < count; i++) {
+        size_t len = sdslen(lines[i]);
+        while (len > 0 && lines[i][len-1] == ' ') len--;
+        lines[i][len] = '\0';
+        sdssetlen(lines[i], len);
+        if (len > 0) last = i + 1;
     }
+    if (last == count && count > 0 && sdslen(lines[count-1]) == 0) last = 0;
 
-    CFRelease(list);
-    return found;
-}
-
-/* Disconnect from current window. */
-void disconnect(void) {
-    Connected = 0;
-    ConnectedWid = 0;
-    ConnectedPid = 0;
-    ConnectedOwner[0] = '\0';
-    ConnectedTitle[0] = '\0';
-}
-
-/* ============================================================================
- * Screenshot Functions
- * ========================================================================= */
-
-int save_png(CGImageRef image, const char *path) {
-    CFStringRef cfpath = CFStringCreateWithCString(NULL, path, kCFStringEncodingUTF8);
-    CFURLRef url = CFURLCreateWithFileSystemPath(NULL, cfpath, kCFURLPOSIXPathStyle, false);
-    CFRelease(cfpath);
-    if (!url) return -1;
-
-    CGImageDestinationRef dest = CGImageDestinationCreateWithURL(url, CFSTR("public.png"), 1, NULL);
-    CFRelease(url);
-    if (!dest) return -1;
-
-    CGImageDestinationAddImage(dest, image, NULL);
-    int ok = CGImageDestinationFinalize(dest);
-    CFRelease(dest);
-    return ok ? 0 : -1;
-}
-
-CGImageRef capture_window(CGWindowID wid) {
-    return CGWindowListCreateImage(CGRectNull, kCGWindowListOptionIncludingWindow, wid,
-        kCGWindowImageBoundsIgnoreFraming | kCGWindowImageNominalResolution);
-}
-
-/* Capture and save screenshot of connected window. Returns 0 on success. */
-int capture_connected_window(const char *path) {
-    if (!Connected) return -1;
-
-    CGImageRef img = capture_window(ConnectedWid);
-    if (!img) return -1;
-
-    int ret = save_png(img, path);
-    CGImageRelease(img);
-    return ret;
-}
-
-/* ============================================================================
- * Keystroke Functions
- * ========================================================================= */
-
-/* Private API to get CGWindowID from AXUIElement. */
-extern AXError _AXUIElementGetWindow(AXUIElementRef element, CGWindowID *wid);
-
-/* Bring app to front. */
-int bring_to_front(pid_t pid) {
-    ProcessSerialNumber psn;
-    if (GetProcessForPID(pid, &psn) != noErr) return -1;
-    if (SetFrontProcessWithOptions(&psn, kSetFrontProcessFrontWindowOnly) != noErr) return -1;
-    usleep(100000);
-    return 0;
-}
-
-/* Raise the specific window by matching CGWindowID via Accessibility API. */
-int raise_window_by_id(pid_t pid, CGWindowID target_wid) {
-    AXUIElementRef app = AXUIElementCreateApplication(pid);
-    if (!app) return -1;
-
-    CFArrayRef windows = NULL;
-    AXUIElementCopyAttributeValue(app, kAXWindowsAttribute, (CFTypeRef *)&windows);
-    CFRelease(app);
-
-    if (!windows) return -1;
-
-    int found = 0;
-    CFIndex count = CFArrayGetCount(windows);
-    for (CFIndex i = 0; i < count; i++) {
-        AXUIElementRef win = (AXUIElementRef)CFArrayGetValueAtIndex(windows, i);
-
-        CGWindowID wid = 0;
-        if (_AXUIElementGetWindow(win, &wid) == kAXErrorSuccess) {
-            if (wid == target_wid) {
-                AXUIElementPerformAction(win, kAXRaiseAction);
-                found = 1;
-                break;
-            }
-        }
+    sds out = sdsempty();
+    for (int i = 0; i < last; i++) {
+        if (i > 0) out = sdscatlen(out, "\n", 1);
+        out = sdscatsds(out, lines[i]);
     }
-
-    CFRelease(windows);
-
-    /* Also bring the app to front. */
-    bring_to_front(pid);
-    return found ? 0 : -1;
+    sdsfreesplitres(lines, count);
+    return out;
 }
 
-/* Map ASCII character to macOS virtual keycode (US keyboard layout). */
-CGKeyCode keycode_for_char(char c) {
-    /* Letters a-z (same codes for upper/lowercase). */
-    static const CGKeyCode letter_map[26] = {
-        0x00,0x0B,0x08,0x02,0x0E,0x03,0x05,0x04,0x22,0x26, /* a-j */
-        0x28,0x25,0x2E,0x2D,0x1F,0x23,0x0C,0x0F,0x01,0x11, /* k-t */
-        0x20,0x09,0x0D,0x07,0x10,0x06                       /* u-z */
-    };
-    /* Digits 0-9. */
-    static const CGKeyCode digit_map[10] = {
-        0x1D,0x12,0x13,0x14,0x15,0x17,0x16,0x1A,0x1C,0x19  /* 0-9 */
-    };
-    /* Punctuation / symbols. */
-    if (c >= 'a' && c <= 'z') return letter_map[c - 'a'];
-    if (c >= 'A' && c <= 'Z') return letter_map[c - 'A'];
-    if (c >= '0' && c <= '9') return digit_map[c - '0'];
-    switch (c) {
-        case '-':  return 0x1B;  case '=':  return 0x18;
-        case '[':  return 0x21;  case ']':  return 0x1E;
-        case '\\': return 0x2A;  case ';':  return 0x29;
-        case '\'': return 0x27;  case ',':  return 0x2B;
-        case '.':  return 0x2F;  case '/':  return 0x2C;
-        case '`':  return 0x32;  case ' ':  return 0x31;
+/* Capture the visible content of the connected terminal. Returns NULL if
+ * the terminal no longer exists. */
+static sds capture_screen(void) {
+    sds out;
+    int err;
+    if (ConnectedKind == TARGET_TMUX) {
+        char *argv[] = {"tmux", "capture-pane", "-p", "-t", ConnectedId, NULL};
+        err = run_command(argv, &out);
+    } else {
+        char *argv[] = {"osascript", "-e", TERMINAL_CONTENTS_SCRIPT, ConnectedId, NULL};
+        err = run_command(argv, &out);
     }
-    return 0xFFFF; /* Unknown. */
+    if (err != 0) return NULL;
+
+    sds screen = trim_screen(out);
+    sdsfree(out);
+    return screen;
 }
 
-void send_key(pid_t pid, CGKeyCode keycode, UniChar ch, int mods) {
-    /* When modifiers are active and we have a character, use the
-     * correct virtual keycode so the system sends the right combo. */
-    int mapped_keycode = 0;
-    if (ch && mods) {
-        CGKeyCode mapped = keycode_for_char((char)ch);
-        if (mapped != 0xFFFF) {
-            keycode = mapped;
-            mapped_keycode = 1;
-        }
-    }
-
-    CGEventRef down = CGEventCreateKeyboardEvent(NULL, keycode, true);
-    CGEventRef up = CGEventCreateKeyboardEvent(NULL, keycode, false);
-    if (!down || !up) {
-        if (down) CFRelease(down);
-        if (up) CFRelease(up);
-        return;
-    }
-
-    CGEventFlags flags = 0;
-    if (mods & MOD_CTRL) flags |= kCGEventFlagMaskControl;
-    if (mods & MOD_ALT)  flags |= kCGEventFlagMaskAlternate;
-    if (mods & MOD_CMD)  flags |= kCGEventFlagMaskCommand;
-
-    if (flags) {
-        CGEventSetFlags(down, flags);
-        CGEventSetFlags(up, flags);
-    }
-
-    /* When we have a mapped keycode with modifiers, let the system
-     * derive the character from keycode + flags. Otherwise set it. */
-    if (ch && !mapped_keycode) {
-        CGEventKeyboardSetUnicodeString(down, 1, &ch);
-        CGEventKeyboardSetUnicodeString(up, 1, &ch);
-    }
-
-    CGEventPostToPid(pid, down);
-    usleep(1000);
-    CGEventPostToPid(pid, up);
-    usleep(5000);
-
-    CFRelease(down);
-    CFRelease(up);
-}
-
-/* Send keystrokes to connected window. Auto-adds newline unless ends with 💜. */
-int send_keys(const char *text) {
-    if (!Connected) return -1;
-
-    raise_window_by_id(ConnectedPid, ConnectedWid);
-
-    /* Check if we should suppress trailing newline. */
+/* Convert a message into the bytes to type: heart modifiers and escape
+ * sequences become control characters (Alt is the ESC prefix). Enter is
+ * appended unless the message ends with 💜, is a single modified key or
+ * bare ESC, or already ends with Enter. */
+static sds keys_to_bytes(const char *text) {
     int add_newline = !ends_with_purple_heart(text);
-
     const unsigned char *p = (const unsigned char *)text;
     size_t len = strlen(text);
 
     /* If ends with purple heart, reduce length to skip it. */
-    if (!add_newline && len >= 4) {
-        len -= 4;
-    }
+    if (!add_newline) len -= 4;
 
+    sds bytes = sdsempty();
     int mods = 0;
     int consumed;
     char heart;
-    int keycount = 0;       /* Number of actual keystrokes sent. */
-    int had_mods = 0;       /* True if any keystroke used modifiers. */
+    int keycount = 0;       /* Number of keystrokes. */
+    int had_special = 0;    /* True if any keystroke was modified or ESC. */
     int last_was_nl = 0;    /* True if last keystroke was Enter. */
 
     while (len > 0) {
@@ -651,130 +564,308 @@ int send_keys(const char *text) {
             continue;
         }
 
-        if ((consumed = match_orange_heart(p, len)) > 0) {
-            send_key(ConnectedPid, kVK_Return, 0, mods);
-            if (mods) had_mods = 1;
-            keycount++; last_was_nl = 1; mods = 0;
+        if ((consumed = match_colored_heart(p, len, &heart)) > 0 && heart == 'B') {
+            mods |= MOD_ALT;
             p += consumed; len -= consumed;
             continue;
         }
 
-        if ((consumed = match_colored_heart(p, len, &heart)) > 0) {
-            if (heart == 'Y') {
-                send_key(ConnectedPid, kVK_Escape, 0, 0);
-                keycount++; had_mods = 1; last_was_nl = 0;
-                mods = 0;
-            } else if (heart == 'B') {
-                mods |= MOD_ALT;
-            } else if (heart == 'G') {
-                mods |= MOD_CMD;
-            }
-            p += consumed; len -= consumed;
-            continue;
+        /* What follows is a key: get the byte it produces. */
+        unsigned char c;
+        if (consumed > 0) {
+            c = 0x1b; had_special = 1;      /* 💛 is ESC. */
+        } else if ((consumed = match_orange_heart(p, len)) > 0) {
+            c = '\r';
+        } else if (*p == '\\' && len > 1 && p[1] == 'n') {
+            c = '\r'; consumed = 2;
+        } else if (*p == '\\' && len > 1 && p[1] == 't') {
+            c = '\t'; consumed = 2;
+        } else if (*p == '\\' && len > 1 && p[1] == '\\') {
+            c = '\\'; consumed = 2;
+        } else {
+            c = *p; consumed = 1;
         }
+        p += consumed; len -= consumed;
 
-        last_was_nl = 0;
-        if (*p == '\\' && len > 1) {
-            if (p[1] == 'n') {
-                send_key(ConnectedPid, kVK_Return, 0, mods);
-                if (mods) had_mods = 1;
-                keycount++; last_was_nl = 1; mods = 0;
-                p += 2; len -= 2;
-                continue;
-            } else if (p[1] == 't') {
-                send_key(ConnectedPid, kVK_Tab, 0, mods);
-                if (mods) had_mods = 1;
-                keycount++; mods = 0; p += 2; len -= 2;
-                continue;
-            } else if (p[1] == '\\') {
-                send_key(ConnectedPid, 0, '\\', mods);
-                if (mods) had_mods = 1;
-                keycount++; mods = 0; p += 2; len -= 2;
-                continue;
-            }
-        }
-
-        send_key(ConnectedPid, 0, (UniChar)*p, mods);
-        if (mods) had_mods = 1;
-        keycount++; mods = 0;
-        p++; len--;
+        if (mods & MOD_ALT) bytes = sdscatlen(bytes, "\x1b", 1);
+        if (mods & MOD_CTRL) c &= 0x1f;
+        bytes = sdscatlen(bytes, &c, 1);
+        if (mods) had_special = 1;
+        last_was_nl = (c == '\r');
+        keycount++;
+        mods = 0;
     }
 
     /* Add newline unless:
      * - Suppressed by purple heart
      * - Single modified keystroke (like Ctrl+C) or bare ESC
      * - Last explicit keystroke was already a newline */
-    if (add_newline && !(keycount == 1 && had_mods) && !last_was_nl) {
-        usleep(50000);
-        send_key(ConnectedPid, kVK_Return, 0, 0);
-    }
+    if (add_newline && !(keycount == 1 && had_special) && !last_was_nl)
+        bytes = sdscatlen(bytes, "\r", 1);
+    return bytes;
+}
 
-    return 0;
+/* Type the given bytes in the connected terminal. Terminal.app always
+ * adds a newline after the typed text, so the trailing Enter, if any, is
+ * removed from 'bytes' to avoid sending it twice. */
+static void type_bytes(sds bytes) {
+    if (ConnectedKind == TARGET_TMUX) {
+        char *argv[] = {"tmux", "send-keys", "-t", ConnectedId, "-l", "--", bytes, NULL};
+        run_command(argv, NULL);
+    } else {
+        size_t len = sdslen(bytes);
+        if (len > 0 && bytes[len-1] == '\r') {
+            bytes[len-1] = '\0';
+            sdssetlen(bytes, len-1);
+        }
+        char *argv[] = {"osascript", "-e", TERMINAL_TYPE_SCRIPT, ConnectedId, bytes, NULL};
+        run_command(argv, NULL);
+    }
+}
+
+/* Send the message text as keystrokes to the connected terminal. */
+static void send_keys(const char *text) {
+    sds bytes = keys_to_bytes(text);
+    type_bytes(bytes);
+    sdsfree(bytes);
 }
 
 /* ============================================================================
- * Bot Command Handlers
+ * Commands
  * ========================================================================= */
 
-/* Build the .list response. */
-sds build_list_message(void) {
-    refresh_window_list();
+/* The bot commands, in the order shown by .help and by the Telegram menu,
+ * where they appear in the "/_" form. Commands with 'keys' set just send
+ * those bytes to the terminal. Connecting with .N is not here, since
+ * Telegram command names can only contain letters, digits and underscores. */
+typedef struct {
+    char *name;
+    char *description;
+    char *keys;
+} Command;
+
+static Command Commands[] = {
+    {"list", "Show tmux panes and Terminal.app tabs", NULL},
+    {"stream", "Keep the screen updated", NULL},
+    {"stop", "Stop streaming", NULL},
+    {"esc", "Send ESC", "\x1b"},
+    {"ctrl_c", "Send Ctrl+C", "\x03"},
+    {"enter", "Send Enter", "\r"},
+    {"tab", "Send Tab", "\t"},
+    {"shift_tab", "Send Shift+Tab", "\x1b[Z"},
+    {"up", "Send arrow up", "\x1b[A"},
+    {"down", "Send arrow down", "\x1b[B"},
+    {"ctrl_d", "Send Ctrl+D", "\x04"},
+    {"help", "Show the commands", NULL},
+    {"otptimeout", "Set the OTP timeout in seconds (30-28800)", NULL},
+};
+
+#define NUM_COMMANDS (sizeof(Commands) / sizeof(Commands[0]))
+
+/* If 'req' is a bot command, that is it starts with "." or with "/_"
+ * (the form used by the Telegram menu), return the text after the
+ * prefix. Otherwise return NULL. */
+static const char *command_body(const char *req) {
+    if (req[0] == '.') return req + 1;
+    if (req[0] == '/' && req[1] == '_') return req + 2;
+    return NULL;
+}
+
+/* If 'req' is the command 'name', return what follows the name: the
+ * arguments, or an empty string. Otherwise return NULL. */
+static const char *command_arg(const char *req, const char *name) {
+    const char *body = command_body(req);
+    if (!body) return NULL;
+    size_t len = strlen(name);
+    if (strncasecmp(body, name, len) != 0) return NULL;
+    if (body[len] != '\0' && body[len] != ' ') return NULL;
+    return body + len;
+}
+
+/* Return true if 'req' is the command 'name' without arguments. */
+static int is_command(const char *req, const char *name) {
+    const char *arg = command_arg(req, name);
+    return arg && *arg == '\0';
+}
+
+/* Register the commands in the Telegram menu, in their "/_" form. */
+static void set_menu(void) {
+    char names[NUM_COMMANDS][64];
+    char *menu[NUM_COMMANDS * 2];
+    for (size_t i = 0; i < NUM_COMMANDS; i++) {
+        snprintf(names[i], sizeof(names[i]), "_%s", Commands[i].name);
+        menu[i*2] = names[i];
+        menu[i*2+1] = Commands[i].description;
+    }
+    botSetMyCommands(menu, NUM_COMMANDS);
+}
+
+/* ============================================================================
+ * Messages
+ * ========================================================================= */
+
+#define SCREEN_MAX_BYTES 4000   /* Telegram messages are limited to 4096 chars. */
+#define REFRESH_BTN "🔄 Refresh"
+#define REFRESH_DATA "refresh"
+#define STOP_BTN "⏹ Stop"
+#define STOP_DATA "stop"
+
+/* Append 'text' to 'html', escaping the characters special in HTML. */
+static sds html_escape(sds html, const char *text) {
+    for (const char *p = text; *p; p++) {
+        if (*p == '<') html = sdscat(html, "&lt;");
+        else if (*p == '>') html = sdscat(html, "&gt;");
+        else if (*p == '&') html = sdscat(html, "&amp;");
+        else html = sdscatlen(html, p, 1);
+    }
+    return html;
+}
+
+/* Build the .list response (HTML). */
+static sds build_list_message(void) {
+    refresh_target_list();
 
     sds msg = sdsempty();
-    if (WindowCount == 0) {
-        msg = sdscat(msg, "No terminal windows found.");
-        return msg;
-    }
+    if (TargetCount == 0) return sdscat(msg, "No tmux panes or Terminal.app tabs found.");
 
-    msg = sdscat(msg, "Terminal windows:\n");
-    for (int i = 0; i < WindowCount; i++) {
-        WinInfo *w = &WindowList[i];
-        char line[512];
-        if (w->title[0]) {
-            snprintf(line, sizeof(line), ".%d [%u] %s - %s\n", i + 1, w->window_id, w->owner, w->title);
-        } else {
-            snprintf(line, sizeof(line), ".%d [%u] %s\n", i + 1, w->window_id, w->owner);
-        }
-        msg = sdscat(msg, line);
+    msg = sdscat(msg, "Terminals:\n");
+    for (int i = 0; i < TargetCount; i++) {
+        msg = sdscatprintf(msg, ".%d ", i + 1);
+        msg = html_escape(msg, TargetList[i].label);
+        msg = sdscat(msg, "\n");
     }
     return msg;
 }
 
-sds build_help_message(void) {
-    return sdsnew(
-        "Commands:\n"
-        ".list - Show terminal windows\n"
-        ".1 .2 ... - Connect to window\n"
-        ".help - This help\n\n"
+/* Build the .help response (HTML). */
+static sds build_help_message(void) {
+    sds msg = sdsnew("Commands (from the menu as /_list, /_esc, ...):\n");
+    for (size_t i = 0; i < NUM_COMMANDS; i++) {
+        msg = sdscatprintf(msg, ".%s - ", Commands[i].name);
+        msg = html_escape(msg, Commands[i].description);
+        msg = sdscat(msg, "\n");
+        if (strcmp(Commands[i].name, "list") == 0)
+            msg = sdscat(msg, ".1 .2 ... - Connect to a terminal\n");
+    }
+    return sdscat(msg,
+        "Any other /text is typed in the terminal.\n\n"
         "Once connected, text is sent as keystrokes.\n"
-        "Newline is auto-added; end with `💜` to suppress it.\n\n"
+        "Newline is auto-added; end with <code>💜</code> to suppress it.\n\n"
         "Modifiers (tap to copy, then paste + key):\n"
-        "`❤️` Ctrl  `💙` Alt  `💚` Cmd  `💛` ESC  `🧡` Enter\n\n"
-        "Escape sequences: \\n=Enter \\t=Tab\n\n"
-        "`.otptimeout <seconds>` - Set OTP timeout (30-28800)"
-    );
+        "<code>❤️</code> Ctrl  <code>💙</code> Alt  "
+        "<code>💛</code> ESC  <code>🧡</code> Enter\n\n"
+        "Escape sequences: \\n=Enter \\t=Tab");
+}
+
+/* Build the HTML message showing the screen content: the text is escaped
+ * and enclosed in a <pre> block. If it is too large, the first lines are
+ * dropped so that the bottom of the screen is preserved. */
+static sds build_screen_message(const char *screen) {
+    sds html = html_escape(sdsempty(), screen);
+
+    if (sdslen(html) > SCREEN_MAX_BYTES) {
+        /* Cut at the first line boundary that makes it fit, or at a
+         * character boundary if a single line is too long. */
+        char *start = html + sdslen(html) - SCREEN_MAX_BYTES;
+        char *nl = strchr(start, '\n');
+        if (nl) {
+            start = nl + 1;
+        } else {
+            while ((*start & 0xC0) == 0x80) start++;
+        }
+        sdsrange(html, start - html, -1);
+    }
+
+    sds msg;
+    if (sdslen(html) == 0) msg = sdsnew("(empty screen)");
+    else msg = sdscatprintf(sdsempty(), "<pre>%s</pre>", html);
+    sdsfree(html);
+    return msg;
+}
+
+/* Text and callback data of the button under screen messages: while
+ * streaming the button stops the stream, otherwise it refreshes. */
+static const char *screen_btn_text(void) {
+    return Streaming ? STOP_BTN : REFRESH_BTN;
+}
+
+static const char *screen_btn_data(void) {
+    return Streaming ? STOP_DATA : REFRESH_DATA;
+}
+
+/* Remember the last screen message and the content it shows.
+ * Takes ownership of 'screen'. */
+static void set_screen_message(int64_t chat_id, int64_t msg_id, sds screen) {
+    ScreenChat = chat_id;
+    ScreenMsgId = msg_id;
+    sdsfree(ScreenLast);
+    ScreenLast = screen;
+    ScreenTime = time(NULL);
+}
+
+/* Send the current screen as a new message. Returns 0 on success, -1 if
+ * the terminal no longer exists. */
+static int send_screen(int64_t chat_id) {
+    sds screen = capture_screen();
+    if (!screen) return -1;
+
+    sds msg = build_screen_message(screen);
+    int64_t msg_id = 0;
+    int ok = botSendMessageHTML(chat_id, msg, screen_btn_text(),
+                                screen_btn_data(), &msg_id);
+    sdsfree(msg);
+    if (ok) set_screen_message(chat_id, msg_id, screen);
+    else sdsfree(screen);
+    return 0;
+}
+
+/* Update an existing screen message with the current screen content.
+ * Unless 'force' is true, the last screen message is not edited when
+ * the content did not change since it was sent. Returns 0 on success,
+ * -1 if the terminal no longer exists. */
+static int refresh_screen(int64_t chat_id, int64_t msg_id, int force) {
+    sds screen = capture_screen();
+    if (!screen) return -1;
+
+    if (!force && msg_id == ScreenMsgId && strcmp(screen, ScreenLast) == 0) {
+        sdsfree(screen);
+        return 0;
+    }
+
+    sds msg = build_screen_message(screen);
+    botEditMessageHTML(chat_id, msg_id, msg, screen_btn_text(), screen_btn_data());
+    sdsfree(msg);
+    if (msg_id == ScreenMsgId) set_screen_message(chat_id, msg_id, screen);
+    else sdsfree(screen);
+    return 0;
+}
+
+/* Disconnect from the current terminal. */
+static void disconnect(void) {
+    Connected = 0;
+    Streaming = 0;
+    ConnectedId[0] = '\0';
+    ConnectedLabel[0] = '\0';
+}
+
+/* Handle the disappearance of the connected terminal: disconnect and
+ * show the list of the remaining ones. */
+static void terminal_closed(int64_t chat_id) {
+    disconnect();
+    sds msg = sdsnew("Terminal closed.\n\n");
+    sds list = build_list_message();
+    msg = sdscatsds(msg, list);
+    sdsfree(list);
+    botSendMessageHTML(chat_id, msg, NULL, NULL, NULL);
+    sdsfree(msg);
 }
 
 /* ============================================================================
  * Telegram Bot Callbacks
  * ========================================================================= */
 
-#define SCREENSHOT_PATH "/tmp/tgterm_screenshot.png"
 #define OWNER_KEY "owner_id"
-#define REFRESH_BTN "🔄 Refresh"
-#define REFRESH_DATA "refresh"
 
-/* Send screenshot with refresh button. */
-void send_screenshot(int64_t chat_id) {
-    if (capture_connected_window(SCREENSHOT_PATH) != 0) return;
-    botSendImageWithKeyboard(chat_id, SCREENSHOT_PATH, REFRESH_BTN, REFRESH_DATA, NULL);
-}
-
-/* Refresh an existing screenshot message by editing its media. */
-void refresh_screenshot(int64_t chat_id, int64_t msg_id) {
-    if (capture_connected_window(SCREENSHOT_PATH) != 0) return;
-    botEditMessageMedia(chat_id, msg_id, SCREENSHOT_PATH, REFRESH_BTN, REFRESH_DATA);
-}
 
 void handle_request(sqlite3 *db, BotRequest *br) {
     pthread_mutex_lock(&RequestLock);
@@ -828,37 +919,68 @@ void handle_request(sqlite3 *db, BotRequest *br) {
         LastActivity = time(NULL);
     }
 
-    /* Handle callback query (button press). */
+    /* Handle callback query (button press): refresh the screen message,
+     * stopping the stream first if the button was Stop. */
     if (br->is_callback) {
         botAnswerCallbackQuery(br->callback_id);
-        if (strcmp(br->callback_data, REFRESH_DATA) == 0 && Connected) {
-            refresh_screenshot(br->target, br->msg_id);
-        }
+        if (!Connected) goto done;
+        int stop = strcmp(br->callback_data, STOP_DATA) == 0;
+        if (stop) Streaming = 0;
+        if (refresh_screen(br->target, br->msg_id, stop) == -1)
+            terminal_closed(br->target);
         goto done;
     }
 
     char *req = br->request;
 
     /* Handle .list command. */
-    if (strcasecmp(req, ".list") == 0) {
+    if (is_command(req, "list")) {
         disconnect();
         sds msg = build_list_message();
-        botSendMessage(br->target, msg, 0);
+        botSendMessageHTML(br->target, msg, NULL, NULL, NULL);
         sdsfree(msg);
         goto done;
     }
 
     /* Handle .help command. */
-    if (strcasecmp(req, ".help") == 0) {
+    if (is_command(req, "help")) {
         sds msg = build_help_message();
-        botSendMessage(br->target, msg, 0);
+        botSendMessageHTML(br->target, msg, NULL, NULL, NULL);
         sdsfree(msg);
         goto done;
     }
 
+    /* Handle .stream command: the screen message sent becomes the one
+     * updated as the terminal content changes. */
+    if (is_command(req, "stream")) {
+        if (!Connected) {
+            botSendMessage(br->target, "Not connected.", 0);
+            goto done;
+        }
+        Streaming = 1;
+        if (send_screen(br->target) == -1) terminal_closed(br->target);
+        goto done;
+    }
+
+    /* Handle .stop command. */
+    if (is_command(req, "stop")) {
+        if (!Streaming) {
+            botSendMessage(br->target, "Not streaming.", 0);
+            goto done;
+        }
+        Streaming = 0;
+        /* Replace the Stop button of the stream message with Refresh. */
+        if (refresh_screen(ScreenChat, ScreenMsgId, 1) == -1) {
+            terminal_closed(br->target);
+        } else {
+            botSendMessage(br->target, "Streaming stopped.", 0);
+        }
+        goto done;
+    }
+
     /* Handle .otptimeout command. */
-    if (strncasecmp(req, ".otptimeout", 11) == 0) {
-        char *arg = req + 11;
+    const char *arg = command_arg(req, "otptimeout");
+    if (arg) {
         while (*arg == ' ') arg++;
         int secs = atoi(arg);
         if (secs < 30) secs = 30;
@@ -873,76 +995,86 @@ void handle_request(sqlite3 *db, BotRequest *br) {
         goto done;
     }
 
-    /* Handle .N to connect to window N. */
-    if (req[0] == '.' && isdigit(req[1])) {
-        int n = atoi(req + 1);
-        refresh_window_list();
+    /* Handle key commands like .esc or .ctrl_c: send the key. */
+    for (size_t i = 0; i < NUM_COMMANDS; i++) {
+        if (!Commands[i].keys || !is_command(req, Commands[i].name)) continue;
+        if (!Connected) {
+            botSendMessage(br->target, "Not connected.", 0);
+            goto done;
+        }
+        sds bytes = sdsnew(Commands[i].keys);
+        type_bytes(bytes);
+        sdsfree(bytes);
+        sleep(1);
+        if (send_screen(br->target) == -1) terminal_closed(br->target);
+        goto done;
+    }
 
-        if (n < 1 || n > WindowCount) {
-            botSendMessage(br->target, "Invalid window number.", 0);
+    /* Handle .N to connect to terminal N. */
+    const char *body = command_body(req);
+    if (body && isdigit((unsigned char)body[0])) {
+        int n = atoi(body);
+        refresh_target_list();
+
+        if (n < 1 || n > TargetCount) {
+            botSendMessage(br->target, "Invalid terminal number.", 0);
             goto done;
         }
 
         /* Store connection info directly. */
-        WinInfo *w = &WindowList[n - 1];
+        Target *t = &TargetList[n - 1];
         Connected = 1;
-        ConnectedWid = w->window_id;
-        ConnectedPid = w->pid;
-        strncpy(ConnectedOwner, w->owner, sizeof(ConnectedOwner) - 1);
-        ConnectedOwner[sizeof(ConnectedOwner) - 1] = '\0';
-        strncpy(ConnectedTitle, w->title, sizeof(ConnectedTitle) - 1);
-        ConnectedTitle[sizeof(ConnectedTitle) - 1] = '\0';
+        ConnectedKind = t->kind;
+        snprintf(ConnectedId, sizeof(ConnectedId), "%s", t->id);
+        snprintf(ConnectedLabel, sizeof(ConnectedLabel), "%s", t->label);
 
-        sds msg = sdsnew("Connected to ");
-        msg = sdscat(msg, ConnectedOwner);
-        if (ConnectedTitle[0]) {
-            msg = sdscat(msg, " - ");
-            msg = sdscat(msg, ConnectedTitle);
-        }
-        botSendMessage(br->target, msg, 0);
+        sds msg = html_escape(sdsnew("Connected to "), ConnectedLabel);
+        botSendMessageHTML(br->target, msg, NULL, NULL, NULL);
         sdsfree(msg);
 
-        /* Raise the window and send welcome screenshot. */
-        raise_window_by_id(w->pid, w->window_id);
-        send_screenshot(br->target);
+        if (send_screen(br->target) == -1) terminal_closed(br->target);
         goto done;
     }
 
     /* Not a command - send as keystrokes if connected. */
     if (!Connected) {
         sds msg = build_list_message();
-        botSendMessage(br->target, msg, 0);
+        botSendMessageHTML(br->target, msg, NULL, NULL, NULL);
         sdsfree(msg);
         goto done;
     }
 
-    /* Check window still exists. */
-    if (!connected_window_exists()) {
-        disconnect();
-        sds msg = sdsnew("Window closed.\n\n");
-        sds list = build_list_message();
-        msg = sdscatsds(msg, list);
-        sdsfree(list);
-        botSendMessage(br->target, msg, 0);
-        sdsfree(msg);
-        goto done;
-    }
-
-    /* Send keystrokes. */
     send_keys(req);
 
-    /* Wait a bit for the terminal to react, then re-check the window
-     * (keystrokes like ESC+N may switch tabs, changing the window ID). */
-    sleep(2);
-    connected_window_exists();
-    send_screenshot(br->target);
+    /* Give the program some time to react before showing the screen. */
+    sleep(1);
+    if (send_screen(br->target) == -1) terminal_closed(br->target);
 
 done:
     pthread_mutex_unlock(&RequestLock);
 }
 
+/* Called by botlib about once per second: while streaming, update the
+ * last screen message when the terminal content changes. */
 void cron_callback(sqlite3 *db) {
     UNUSED(db);
+
+    /* Set the Telegram commands menu once. This is done here and not in
+     * main() since the API key is only available after startBot(). */
+    static int menu_set = 0;
+    if (!menu_set) {
+        set_menu();
+        menu_set = 1;
+    }
+
+    /* Don't wait for requests in progress: we'll retry at the next call. */
+    if (pthread_mutex_trylock(&RequestLock) != 0) return;
+
+    if (Streaming && time(NULL) - ScreenTime >= STREAM_INTERVAL) {
+        if (refresh_screen(ScreenChat, ScreenMsgId, 0) == -1)
+            terminal_closed(ScreenChat);
+    }
+    pthread_mutex_unlock(&RequestLock);
 }
 
 /* ============================================================================
@@ -953,10 +1085,7 @@ int main(int argc, char **argv) {
     /* Parse our custom flags. */
     const char *dbfile = "./mybot.sqlite";
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--dangerously-attach-to-any-window") == 0) {
-            DangerMode = 1;
-            printf("DANGER MODE: All windows will be visible.\n");
-        } else if (strcmp(argv[i], "--use-weak-security") == 0) {
+        if (strcmp(argv[i], "--use-weak-security") == 0) {
             WeakSecurity = 1;
             printf("WARNING: OTP authentication disabled.\n");
         } else if (strcmp(argv[i], "--dbfile") == 0 && i+1 < argc) {

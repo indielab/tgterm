@@ -1,7 +1,5 @@
-CC = clang
-CFLAGS = -Wall -O2 -mmacosx-version-min=14.0
-FRAMEWORKS = -framework CoreGraphics -framework CoreFoundation -framework ImageIO \
-             -framework CoreServices -framework ApplicationServices
+CC = cc
+CFLAGS = -Wall -O2
 LIBS = -lcurl -lsqlite3
 
 OBJS = bot.o botlib.o sds.o cJSON.o sqlite_wrap.o json_wrap.o qrcodegen.o sha1.o
@@ -9,7 +7,7 @@ OBJS = bot.o botlib.o sds.o cJSON.o sqlite_wrap.o json_wrap.o qrcodegen.o sha1.o
 all: tgterm
 
 tgterm: $(OBJS)
-	$(CC) $(CFLAGS) -o $@ $(OBJS) $(FRAMEWORKS) $(LIBS)
+	$(CC) $(CFLAGS) -o $@ $(OBJS) $(LIBS)
 
 bot.o: bot.c botlib.h sds.h
 	$(CC) $(CFLAGS) -c bot.c

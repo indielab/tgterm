@@ -1,4 +1,9 @@
-A macOS tool to capture screenshots of terminal application windows (Terminal, iTerm2, Ghostty, kitty, etc.) and inject keystrokes into them. Uses Core Graphics APIs.
+A Telegram bot to control tmux panes and macOS Terminal.app tabs: it reads
+the screen content with `tmux capture-pane` or the AppleScript `contents`
+property, and injects keystrokes with `tmux send-keys` or AppleScript
+`do script`, running `osascript`. Version 1, that captured screenshots of
+terminal windows and injected keystrokes with Core Graphics, is preserved
+in the `screenshot-based` branch.
 
 # File Structure
 
@@ -25,4 +30,8 @@ sha1.c, sha1.h             - SHA-1 + HMAC-SHA1 (Steve Reid, public domain)
 
 # Debugging
 
-Put here information that is critical to debug this project.
+- `--debug` prints every Telegram API request. Screen messages are sent
+  with POST requests, so the body is printed as well.
+- tmux and osascript errors are silenced: run the same command by hand to
+  see them. The AppleScript programs are the TERMINAL_*_SCRIPT macros in
+  bot.c, they can be pasted in Script Editor.

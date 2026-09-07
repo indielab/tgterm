@@ -253,12 +253,14 @@ size_t makeHTTPGETCallWriterFILE(char *ptr, size_t size, size_t nmemb, void *use
 
 
 /* Request the specified URL in a blocking way, returns the content (or
- * error string) as an SDS string. If 'resptr' is not NULL, the integer
+ * error string) as an SDS string. If 'postfields' is not NULL, a POST
+ * request with the given URL encoded body is performed, otherwise a GET
+ * request is performed. If 'resptr' is not NULL, the integer
  * will be set, by reference, to 1 or 0 to indicate success or error.
  * The returned SDS string must be freed by the caller both in case of
  * error and success. */
-sds makeHTTPGETCall(const char *url, int *resptr) {
-    if (Bot.debug) printf("HTTP GET %s\n", url);
+static sds makeHTTPCall(const char *url, const char *postfields, int *resptr) {
+    if (Bot.debug) printf("HTTP %s %s\n", postfields ? "POST" : "GET", url);
     CURL* curl;
     CURLcode res;
     sds body = sdsempty();
@@ -266,6 +268,7 @@ sds makeHTTPGETCall(const char *url, int *resptr) {
     curl = curl_easy_init();
     if (curl) {
         curl_easy_setopt(curl, CURLOPT_URL, url);
+        if (postfields) curl_easy_setopt(curl, CURLOPT_POSTFIELDS, postfields);
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, makeHTTPGETCallWriterSDS);
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, &body);
         curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
@@ -294,27 +297,53 @@ sds makeHTTPGETCall(const char *url, int *resptr) {
     return body;
 }
 
+/* Perform a GET request. See makeHTTPCall() for details. */
+sds makeHTTPGETCall(const char *url, int *resptr) {
+    return makeHTTPCall(url,NULL,resptr);
+}
+
+/* Return the option list (optnum*2 strings, alternating option names
+ * and values) as an URL encoded query string. */
+static sds urlEncodeOptions(char **optlist, int optnum) {
+    sds query = sdsempty();
+    CURL *curl = curl_easy_init();
+    for (int j = 0; j < optnum; j++) {
+        if (j > 0) query = sdscatlen(query,"&",1);
+        query = sdscat(query,optlist[j*2]);
+        query = sdscatlen(query,"=",1);
+        char *escaped = curl_easy_escape(curl,
+            optlist[j*2+1],strlen(optlist[j*2+1]));
+        query = sdscat(query,escaped);
+        curl_free(escaped);
+    }
+    curl_easy_cleanup(curl);
+    return query;
+}
+
 /* Like makeHTTPGETCall(), but the list of options will be concatenated to
  * the URL as a query string, and URL encoded as needed.
  * The option list array should contain optnum*2 strings, alternating
  * option names and values. */
 sds makeHTTPGETCallOpt(const char *url, int *resptr, char **optlist, int optnum) {
     sds fullurl = sdsnew(url);
-    if (optnum) fullurl = sdscatlen(fullurl,"?",1);
-    CURL *curl = curl_easy_init();
-    for (int j = 0; j < optnum; j++) {
-        if (j > 0) fullurl = sdscatlen(fullurl,"&",1);
-        fullurl = sdscat(fullurl,optlist[j*2]);
-        fullurl = sdscatlen(fullurl,"=",1);
-        char *escaped = curl_easy_escape(curl,
-            optlist[j*2+1],strlen(optlist[j*2+1]));
-        fullurl = sdscat(fullurl,escaped);
-        curl_free(escaped);
+    if (optnum) {
+        sds query = urlEncodeOptions(optlist,optnum);
+        fullurl = sdscatlen(fullurl,"?",1);
+        fullurl = sdscatsds(fullurl,query);
+        sdsfree(query);
     }
-    curl_easy_cleanup(curl);
     sds body = makeHTTPGETCall(fullurl,resptr);
     sdsfree(fullurl);
     return body;
+}
+
+/* Return the Telegram bot API URL for the specified action. */
+static sds botActionUrl(const char *action) {
+    sds url = sdsnew("https://api.telegram.org/bot");
+    url = sdscat(url,Bot.apikey);
+    url = sdscatlen(url,"/",1);
+    url = sdscat(url,action);
+    return url;
 }
 
 /* Make an HTTP request to the Telegram bot API, where 'req' is the specified
@@ -323,13 +352,31 @@ sds makeHTTPGETCallOpt(const char *url, int *resptr, char **optlist, int optnum)
  * makeHTTPGETCall(). */
 sds makeGETBotRequest(const char *action, int *resptr, char **optlist, int numopt)
 {
-    sds url = sdsnew("https://api.telegram.org/bot");
-    url = sdscat(url,Bot.apikey);
-    url = sdscatlen(url,"/",1);
-    url = sdscat(url,action);
+    sds url = botActionUrl(action);
     sds body = makeHTTPGETCallOpt(url,resptr,optlist,numopt);
     sdsfree(url);
     return body;
+}
+
+/* Like makeGETBotRequest(), but the options are sent URL encoded in the
+ * body of a POST request. This is needed when the values are large, like
+ * long messages, since URLs have a limited length. */
+sds makePOSTBotRequest(const char *action, int *resptr, char **optlist, int numopt)
+{
+    sds url = botActionUrl(action);
+    sds fields = urlEncodeOptions(optlist,numopt);
+    sds body = makeHTTPCall(url,fields,resptr);
+    sdsfree(fields);
+    sdsfree(url);
+    return body;
+}
+
+/* Build the reply_markup JSON for an inline keyboard with a single
+ * button. */
+static sds inlineKeyboard(const char *btn_text, const char *btn_data) {
+    return sdscatprintf(sdsempty(),
+        "{\"inline_keyboard\":[[{\"text\":\"%s\",\"callback_data\":\"%s\"}]]}",
+        btn_text, btn_data);
 }
 
 /* Send an image using the sendPhoto endpoint. Return 1 on success, 0
@@ -416,10 +463,7 @@ int botSendImageWithKeyboard(int64_t target, char *filename, const char *btn_tex
                  CURLFORM_FILE, filename,
                  CURLFORM_END);
 
-    /* Build inline keyboard JSON. */
-    sds keyboard = sdscatprintf(sdsempty(),
-        "{\"inline_keyboard\":[[{\"text\":\"%s\",\"callback_data\":\"%s\"}]]}",
-        btn_text, btn_data);
+    sds keyboard = inlineKeyboard(btn_text, btn_data);
     curl_formadd(&formpost, &lastptr,
                  CURLFORM_COPYNAME, "reply_markup",
                  CURLFORM_COPYCONTENTS, keyboard,
@@ -505,9 +549,7 @@ int botEditMessageMedia(int64_t chat_id, int64_t message_id, char *filename, con
 
     /* Inline keyboard. */
     if (btn_text && btn_data) {
-        sds keyboard = sdscatprintf(sdsempty(),
-            "{\"inline_keyboard\":[[{\"text\":\"%s\",\"callback_data\":\"%s\"}]]}",
-            btn_text, btn_data);
+        sds keyboard = inlineKeyboard(btn_text, btn_data);
         curl_formadd(&formpost, &lastptr,
                      CURLFORM_COPYNAME, "reply_markup",
                      CURLFORM_COPYCONTENTS, keyboard,
@@ -652,6 +694,93 @@ int botEditMessageText(int64_t chat_id, int message_id, sds text) {
     sdsfree(body);
     sdsfree(options[1]);
     sdsfree(options[3]);
+    return res;
+}
+
+/* Send a message with HTML formatting and, if btn_text is not NULL, an
+ * inline keyboard with a single button. If msg_id is not NULL, the ID of
+ * the sent message is returned by reference. The request is a POST, so
+ * the message can be as large as Telegram allows.
+ * Return 1 on success, 0 on error. */
+int botSendMessageHTML(int64_t target, sds text, const char *btn_text, const char *btn_data, int64_t *msg_id) {
+    char *options[8];
+    int optlen = 3;
+    options[0] = "chat_id";
+    options[1] = sdsfromlonglong(target);
+    options[2] = "text";
+    options[3] = text;
+    options[4] = "parse_mode";
+    options[5] = "HTML";
+    options[6] = "reply_markup";
+    options[7] = btn_text ? inlineKeyboard(btn_text,btn_data) : NULL;
+    if (options[7]) optlen++;
+
+    int res;
+    sds body = makePOSTBotRequest("sendMessage",&res,options,optlen);
+    if (res && msg_id) {
+        cJSON *json = cJSON_Parse(body);
+        cJSON *mid = cJSON_Select(json,".result.message_id:n");
+        if (mid) *msg_id = (int64_t) mid->valuedouble;
+        cJSON_Delete(json);
+    }
+    if (res == 0) printf("botSendMessageHTML() error: %s\n", body);
+    sdsfree(body);
+    sdsfree(options[1]);
+    sdsfree(options[7]);
+    return res;
+}
+
+/* Set the commands shown in the Telegram bot menu. 'commands' contains
+ * count*2 strings, alternating command names and descriptions.
+ * Return 1 on success, 0 on error. */
+int botSetMyCommands(char **commands, int count) {
+    cJSON *array = cJSON_CreateArray();
+    for (int j = 0; j < count; j++) {
+        cJSON *cmd = cJSON_CreateObject();
+        cJSON_AddStringToObject(cmd,"command",commands[j*2]);
+        cJSON_AddStringToObject(cmd,"description",commands[j*2+1]);
+        cJSON_AddItemToArray(array,cmd);
+    }
+    char *json = cJSON_PrintUnformatted(array);
+    cJSON_Delete(array);
+
+    char *options[2];
+    options[0] = "commands";
+    options[1] = json;
+    int res;
+    sds body = makePOSTBotRequest("setMyCommands",&res,options,1);
+    if (res == 0) printf("botSetMyCommands() error: %s\n", body);
+    sdsfree(body);
+    cJSON_free(json);
+    return res;
+}
+
+/* Edit the text of a message, with HTML formatting and the same keyboard
+ * handling of botSendMessageHTML(). Note that editing a message without
+ * specifying a keyboard removes the old one.
+ * Return 1 on success, 0 on error. */
+int botEditMessageHTML(int64_t chat_id, int64_t message_id, sds text, const char *btn_text, const char *btn_data) {
+    char *options[10];
+    int optlen = 4;
+    options[0] = "chat_id";
+    options[1] = sdsfromlonglong(chat_id);
+    options[2] = "message_id";
+    options[3] = sdsfromlonglong(message_id);
+    options[4] = "text";
+    options[5] = text;
+    options[6] = "parse_mode";
+    options[7] = "HTML";
+    options[8] = "reply_markup";
+    options[9] = btn_text ? inlineKeyboard(btn_text,btn_data) : NULL;
+    if (options[9]) optlen++;
+
+    int res;
+    sds body = makePOSTBotRequest("editMessageText",&res,options,optlen);
+    if (res == 0) printf("botEditMessageHTML() error: %s\n", body);
+    sdsfree(body);
+    sdsfree(options[1]);
+    sdsfree(options[3]);
+    sdsfree(options[9]);
     return res;
 }
 

@@ -80,13 +80,17 @@ sds makeHTTPGETCall(const char *url, int *resptr);
 
 int startBot(char *createdb_query, int argc, char **argv, int flags, TBRequestCallback req_callback, TBCronCallback cron_callback, char **triggers);
 sds makeGETBotRequest(const char *action, int *resptr, char **optlist, int numopt);
+sds makePOSTBotRequest(const char *action, int *resptr, char **optlist, int numopt);
 int botSendMessageAndGetInfo(int64_t target, sds text, int64_t reply_to, int64_t *chat_id, int64_t *message_id);
 int botSendMessage(int64_t target, sds text, int64_t reply_to);
 int botEditMessageText(int64_t chat_id, int message_id, sds text);
+int botSendMessageHTML(int64_t target, sds text, const char *btn_text, const char *btn_data, int64_t *msg_id);
+int botEditMessageHTML(int64_t chat_id, int64_t message_id, sds text, const char *btn_text, const char *btn_data);
 int botSendImage(int64_t target, char *filename);
 int botSendImageWithKeyboard(int64_t target, char *filename, const char *btn_text, const char *btn_data, int64_t *msg_id);
 int botEditMessageMedia(int64_t chat_id, int64_t message_id, char *filename, const char *btn_text, const char *btn_data);
 int botAnswerCallbackQuery(const char *callback_id);
+int botSetMyCommands(char **commands, int count);
 int botGetFile(BotRequest *br, const char *target_filename);
 char *botGetUsername(void);
 void freeBotRequest(BotRequest *br);
